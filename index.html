@@ -1,0 +1,433 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Slider } from "@/components/ui/slider";
+import { Download, Image as ImageIcon, Layers, RefreshCw } from "lucide-react";
+
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+function loadImageFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      resolve({ img, url });
+    };
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+function drawCoverFit(ctx, img, targetW, targetH) {
+  const ir = img.width / img.height;
+  const tr = targetW / targetH;
+  let sx = 0;
+  let sy = 0;
+  let sw = img.width;
+  let sh = img.height;
+
+  if (ir > tr) {
+    sw = img.height * tr;
+    sx = (img.width - sw) / 2;
+  } else {
+    sh = img.width / tr;
+    sy = (img.height - sh) / 2;
+  }
+
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetW, targetH);
+}
+
+function getImageDataScaled(img, width, height) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  drawCoverFit(ctx, img, width, height);
+  return ctx.getImageData(0, 0, width, height);
+}
+
+function sampleNearest(data, w, h, x, y) {
+  const xx = clamp(Math.round(x), 0, w - 1);
+  const yy = clamp(Math.round(y), 0, h - 1);
+  const idx = (yy * w + xx) * 4;
+  return [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
+}
+
+function generateDepthFallbackFromLuma(imageData) {
+  const { data, width, height } = imageData;
+  const out = new Uint8ClampedArray(width * height * 4);
+  for (let i = 0; i < width * height; i++) {
+    const idx = i * 4;
+    const r = data[idx];
+    const g = data[idx + 1];
+    const b = data[idx + 2];
+    const l = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    out[idx] = l;
+    out[idx + 1] = l;
+    out[idx + 2] = l;
+    out[idx + 3] = 255;
+  }
+  return new ImageData(out, width, height);
+}
+
+function createPattern({
+  sourceImageData,
+  depthImageData,
+  width,
+  height,
+  viewsX,
+  viewsY,
+  cellW,
+  cellH,
+  maxShiftX,
+  maxShiftY,
+  depthInfluence,
+  invertDepth,
+}) {
+  const src = sourceImageData.data;
+  const dep = depthImageData.data;
+  const out = new Uint8ClampedArray(width * height * 4);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const cx = x % cellW;
+      const cy = y % cellH;
+
+      const vx = viewsX === 1 ? 0 : (cx / (cellW - 1 || 1)) * 2 - 1;
+      const vy = viewsY === 1 ? 0 : (cy / (cellH - 1 || 1)) * 2 - 1;
+
+      const didx = (y * width + x) * 4;
+      let d = dep[didx] / 255;
+      if (invertDepth) d = 1 - d;
+      const centered = (d - 0.5) * 2;
+
+      const shiftX = centered * maxShiftX * vx * depthInfluence;
+      const shiftY = centered * maxShiftY * vy * depthInfluence;
+
+      const [r, g, b, a] = sampleNearest(src, width, height, x - shiftX, y - shiftY);
+      out[didx] = r;
+      out[didx + 1] = g;
+      out[didx + 2] = b;
+      out[didx + 3] = a;
+    }
+  }
+
+  return new ImageData(out, width, height);
+}
+
+export default function MicrolensPatternGenerator() {
+  const previewCanvasRef = useRef(null);
+  const patternCanvasRef = useRef(null);
+
+  const [sourceFileName, setSourceFileName] = useState("Nessuna immagine");
+  const [depthFileName, setDepthFileName] = useState("Auto da luminanza");
+  const [sourceImg, setSourceImg] = useState(null);
+  const [depthImg, setDepthImg] = useState(null);
+
+  const [outputWidth, setOutputWidth] = useState(1200);
+  const [outputHeight, setOutputHeight] = useState(1200);
+  const [viewsX, setViewsX] = useState(9);
+  const [viewsY, setViewsY] = useState(9);
+  const [cellW, setCellW] = useState(9);
+  const [cellH, setCellH] = useState(9);
+  const [maxShiftX, setMaxShiftX] = useState(12);
+  const [maxShiftY, setMaxShiftY] = useState(12);
+  const [depthInfluence, setDepthInfluence] = useState(1);
+  const [invertDepth, setInvertDepth] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [status, setStatus] = useState("Carica un'immagine sorgente per iniziare.");
+
+  const hasSource = !!sourceImg;
+
+  const parameterHint = useMemo(() => {
+    return `Microcella ${cellW}×${cellH}px • Viste ${viewsX}×${viewsY} • Shift ${maxShiftX}/${maxShiftY}px`;
+  }, [cellW, cellH, viewsX, viewsY, maxShiftX, maxShiftY]);
+
+  async function handleSourceUpload(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const { img } = await loadImageFromFile(file);
+    setSourceImg(img);
+    setSourceFileName(file.name);
+    setStatus("Immagine sorgente caricata. Ora puoi generare il pattern.");
+  }
+
+  async function handleDepthUpload(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const { img } = await loadImageFromFile(file);
+    setDepthImg(img);
+    setDepthFileName(file.name);
+    setStatus("Depth map caricata. Ottimo: il pattern sarà più credibile.");
+  }
+
+  function resetAll() {
+    setSourceImg(null);
+    setDepthImg(null);
+    setSourceFileName("Nessuna immagine");
+    setDepthFileName("Auto da luminanza");
+    setStatus("Pronto per un nuovo test.");
+    const pctx = previewCanvasRef.current?.getContext("2d");
+    const gctx = patternCanvasRef.current?.getContext("2d");
+    if (pctx && previewCanvasRef.current) {
+      pctx.clearRect(0, 0, previewCanvasRef.current.width, previewCanvasRef.current.height);
+    }
+    if (gctx && patternCanvasRef.current) {
+      gctx.clearRect(0, 0, patternCanvasRef.current.width, patternCanvasRef.current.height);
+    }
+  }
+
+  function generate() {
+    if (!sourceImg || !patternCanvasRef.current || !previewCanvasRef.current) return;
+    setIsGenerating(true);
+
+    requestAnimationFrame(() => {
+      try {
+        const srcData = getImageDataScaled(sourceImg, outputWidth, outputHeight);
+        const depthData = depthImg
+          ? getImageDataScaled(depthImg, outputWidth, outputHeight)
+          : generateDepthFallbackFromLuma(srcData);
+
+        const pattern = createPattern({
+          sourceImageData: srcData,
+          depthImageData: depthData,
+          width: outputWidth,
+          height: outputHeight,
+          viewsX,
+          viewsY,
+          cellW,
+          cellH,
+          maxShiftX,
+          maxShiftY,
+          depthInfluence,
+          invertDepth,
+        });
+
+        const patternCanvas = patternCanvasRef.current;
+        patternCanvas.width = outputWidth;
+        patternCanvas.height = outputHeight;
+        const pctx = patternCanvas.getContext("2d", { willReadFrequently: true });
+        pctx.putImageData(pattern, 0, 0);
+
+        const previewCanvas = previewCanvasRef.current;
+        const previewSize = 520;
+        previewCanvas.width = previewSize;
+        previewCanvas.height = previewSize;
+        const pvctx = previewCanvas.getContext("2d", { willReadFrequently: true });
+        pvctx.clearRect(0, 0, previewSize, previewSize);
+        pvctx.drawImage(patternCanvas, 0, 0, previewSize, previewSize);
+
+        pvctx.save();
+        pvctx.strokeStyle = "rgba(255,255,255,0.22)";
+        for (let x = 0; x <= previewSize; x += Math.max(4, previewSize / 24)) {
+          pvctx.beginPath();
+          pvctx.moveTo(x, 0);
+          pvctx.lineTo(x, previewSize);
+          pvctx.stroke();
+        }
+        for (let y = 0; y <= previewSize; y += Math.max(4, previewSize / 24)) {
+          pvctx.beginPath();
+          pvctx.moveTo(0, y);
+          pvctx.lineTo(previewSize, y);
+          pvctx.stroke();
+        }
+        pvctx.restore();
+
+        setStatus("Pattern generato. Scaricalo in PNG e fai il primo test con la tua lastra a microsfere.");
+      } catch (err) {
+        setStatus(`Errore: ${err?.message || "qualcosa è andato storto"}`);
+      } finally {
+        setIsGenerating(false);
+      }
+    });
+  }
+
+  function downloadPNG() {
+    const canvas = patternCanvasRef.current;
+    if (!canvas) return;
+    const link = document.createElement("a");
+    link.download = `microlens-pattern-${outputWidth}x${outputHeight}.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+  }
+
+  useEffect(() => {
+    if (!sourceImg || !previewCanvasRef.current) return;
+    const canvas = previewCanvasRef.current;
+    const ctx = canvas.getContext("2d");
+    const size = 520;
+    canvas.width = size;
+    canvas.height = size;
+    drawCoverFit(ctx, sourceImg, size, size);
+  }, [sourceImg]);
+
+  return (
+    <div className="min-h-screen bg-zinc-950 text-zinc-50 p-6">
+      <div className="max-w-7xl mx-auto grid grid-cols-1 xl:grid-cols-3 gap-6">
+        <div className="xl:col-span-2 space-y-6">
+          <Card className="bg-zinc-900 border-zinc-800 rounded-3xl shadow-2xl">
+            <CardHeader>
+              <CardTitle className="text-2xl flex items-center gap-3">
+                <Layers className="w-6 h-6" />
+                Microlens Pattern Generator
+              </CardTitle>
+              <p className="text-sm text-zinc-400">
+                Webapp prototipale per creare il pattern da stampare sotto una lastra a microsfere. Non sostituisce una calibrazione ottica industriale, ma è perfetta per fare test rapidi da laboratorio.
+              </p>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <Label>Immagine sorgente</Label>
+                    <Input type="file" accept="image/*" onChange={handleSourceUpload} className="bg-zinc-950 border-zinc-800" />
+                    <p className="text-xs text-zinc-400">{sourceFileName}</p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>Depth map opzionale</Label>
+                    <Input type="file" accept="image/*" onChange={handleDepthUpload} className="bg-zinc-950 border-zinc-800" />
+                    <p className="text-xs text-zinc-400">{depthFileName}</p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label>Larghezza output</Label>
+                      <Input type="number" value={outputWidth} min={256} max={4096} step={1} onChange={(e) => setOutputWidth(Number(e.target.value) || 1200)} className="bg-zinc-950 border-zinc-800" />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Altezza output</Label>
+                      <Input type="number" value={outputHeight} min={256} max={4096} step={1} onChange={(e) => setOutputHeight(Number(e.target.value) || 1200)} className="bg-zinc-950 border-zinc-800" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-3xl border border-zinc-800 bg-black/40 p-4">
+                  <canvas ref={previewCanvasRef} className="w-full aspect-square rounded-2xl bg-zinc-950 border border-zinc-800" />
+                  <div className="mt-3 text-xs text-zinc-400 flex items-center gap-2">
+                    <ImageIcon className="w-4 h-4" />
+                    Anteprima sorgente o pattern generato
+                  </div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="bg-zinc-900 border-zinc-800 rounded-3xl shadow-2xl">
+            <CardHeader>
+              <CardTitle className="text-xl">Parametri della microcella</CardTitle>
+              <p className="text-sm text-zinc-400">{parameterHint}</p>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="space-y-4">
+                  <div>
+                    <Label>Viste orizzontali: {viewsX}</Label>
+                    <Slider value={[viewsX]} min={1} max={17} step={1} onValueChange={(v) => setViewsX(v[0])} className="mt-2" />
+                  </div>
+                  <div>
+                    <Label>Viste verticali: {viewsY}</Label>
+                    <Slider value={[viewsY]} min={1} max={17} step={1} onValueChange={(v) => setViewsY(v[0])} className="mt-2" />
+                  </div>
+                  <div>
+                    <Label>Cell width px: {cellW}</Label>
+                    <Slider value={[cellW]} min={2} max={24} step={1} onValueChange={(v) => setCellW(v[0])} className="mt-2" />
+                  </div>
+                  <div>
+                    <Label>Cell height px: {cellH}</Label>
+                    <Slider value={[cellH]} min={2} max={24} step={1} onValueChange={(v) => setCellH(v[0])} className="mt-2" />
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                  <div>
+                    <Label>Shift X massimo: {maxShiftX}px</Label>
+                    <Slider value={[maxShiftX]} min={0} max={40} step={1} onValueChange={(v) => setMaxShiftX(v[0])} className="mt-2" />
+                  </div>
+                  <div>
+                    <Label>Shift Y massimo: {maxShiftY}px</Label>
+                    <Slider value={[maxShiftY]} min={0} max={40} step={1} onValueChange={(v) => setMaxShiftY(v[0])} className="mt-2" />
+                  </div>
+                  <div>
+                    <Label>Influenza depth: {depthInfluence.toFixed(2)}</Label>
+                    <Slider value={[depthInfluence]} min={0} max={2} step={0.05} onValueChange={(v) => setDepthInfluence(v[0])} className="mt-2" />
+                  </div>
+                  <label className="flex items-center gap-3 text-sm text-zinc-300 pt-2">
+                    <input type="checkbox" checked={invertDepth} onChange={(e) => setInvertDepth(e.target.checked)} className="rounded" />
+                    Inverti depth map
+                  </label>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-3 pt-2">
+                <Button onClick={generate} disabled={!hasSource || isGenerating} className="rounded-2xl">
+                  {isGenerating ? <RefreshCw className="w-4 h-4 mr-2 animate-spin" /> : <Layers className="w-4 h-4 mr-2" />} 
+                  Genera pattern
+                </Button>
+                <Button variant="secondary" onClick={downloadPNG} disabled={!hasSource} className="rounded-2xl bg-zinc-100 text-zinc-900 hover:bg-white">
+                  <Download className="w-4 h-4 mr-2" />
+                  Scarica PNG
+                </Button>
+                <Button variant="outline" onClick={resetAll} className="rounded-2xl border-zinc-700 bg-transparent text-zinc-100 hover:bg-zinc-800">
+                  Reset
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        <div className="space-y-6">
+          <Card className="bg-zinc-900 border-zinc-800 rounded-3xl shadow-2xl">
+            <CardHeader>
+              <CardTitle className="text-xl">Guida rapida</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4 text-sm text-zinc-300 leading-6">
+              <p>
+                1. Carica una foto con soggetto ben separato dallo sfondo.
+              </p>
+              <p>
+                2. Se ce l'hai, carica una depth map in scala di grigi. Se non la carichi, la webapp userà una stima grezza dalla luminanza.
+              </p>
+              <p>
+                3. Regola microcella e shift. Le immagini da testare sotto una lastra a microsfere spesso richiedono parecchi tentativi, come una ricetta ottica che vuole il suo assaggio.
+              </p>
+              <p>
+                4. Genera il pattern, scaricalo, stampalo e verifica la resa con diverse distanze tra stampa e lastra.
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card className="bg-zinc-900 border-zinc-800 rounded-3xl shadow-2xl">
+            <CardHeader>
+              <CardTitle className="text-xl">Nota tecnica</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4 text-sm text-zinc-300 leading-6">
+              <p>
+                Questo prototipo genera una <strong>elemental image array</strong> semplificata. Per una calibrazione precisa servono pitch reale delle microsfere, focale, spessore ottico, distanza di osservazione e rapporto stampa/mm.
+              </p>
+              <p>
+                Per i primi test usa immagini semplici: volto, fiore, oggetto centrale, pattern a piani distinti. Le scene troppo affollate diventano zuppa ottica.
+              </p>
+              <p className="text-zinc-400">
+                Stato: {status}
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card className="bg-zinc-900 border-zinc-800 rounded-3xl shadow-2xl">
+            <CardHeader>
+              <CardTitle className="text-xl">Canvas output</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <canvas ref={patternCanvasRef} className="w-full aspect-square rounded-2xl bg-zinc-950 border border-zinc-800" />
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </div>
+  );
+}
