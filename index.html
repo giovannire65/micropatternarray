@@ -1,81 +1,15 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Slider } from "@/components/ui/slider";
-import { Download, Image as ImageIcon, Layers, RefreshCw, Info } from "lucide-react";
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Microlens Pattern Generator</title>
+</head>
 
-/**
- * Microlens Pattern Generator
- *
- * GitHub-ready single file React app.
- *
- * What it does:
- * - loads a source image
- * - optionally loads a grayscale depth map
- * - generates a simplified elemental image array for microlens testing
- * - previews the generated pattern
- * - exports the result as PNG
- *
- * Notes:
- * - this is a laboratory prototype for fast visual experiments
- * - it does not replace optical calibration based on real lens pitch, focal length, material thickness, or print scaling in mm
- */
+<body>
 
-type LoadedImage = HTMLImageElement | null;
+<div id="root"></div>
 
-type PatternOptions = {
-  sourceImageData: ImageData;
-  depthImageData: ImageData;
-  width: number;
-  height: number;
-  viewsX: number;
-  viewsY: number;
-  cellW: number;
-  cellH: number;
-  maxShiftX: number;
-  maxShiftY: number;
-  depthInfluence: number;
-  invertDepth: boolean;
-};
+<script type="module" src="/src/main.jsx"></script>
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-function loadImageFromFile(file: File): Promise<{ img: HTMLImageElement; url: string }> {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-
-    img.onload = () => resolve({ img, url });
-    img.onerror = () => reject(new Error(`Unable to load image: ${file.name}`));
-    img.src = url;
-  });
-}
-
-function drawCoverFit(
-  ctx: CanvasRenderingContext2D,
-  img: HTMLImageElement,
-  targetW: number,
-  targetH: number,
-): void {
-  const imageRatio = img.width / img.height;
-  const targetRatio = targetW / targetH;
-
-  let sx = 0;
-  let sy = 0;
-  let sw = img.width;
-  let sh = img.height;
-
-  if (imageRatio > targetRatio) {
-    sw = img.height * targetRatio;
-    sx = (img.width - sw) / 2;
-  } else {
-    sh = img.width / targetRatio;
-    sy = (img.height - sh) / 2;
-  }
-
-  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetW, targetH);
-}
+</body>
+</html>
